@@ -145,8 +145,8 @@ lazy val docs = project
     mdocVariables  := Map(
       "VERSION" -> version.value
     ),
-    mdocIn  := file("mechanoid-docs") / "docs",
-    mdocOut := file("."),
+    mdocIn  := baseDirectory.value / "docs",
+    mdocOut := (ThisBuild / baseDirectory).value,
     // ZIO deps are "provided" at root level, so mdoc needs them explicitly
     libraryDependencies ++= Seq(
       "dev.zio" %% "zio"         % zioVersion,
