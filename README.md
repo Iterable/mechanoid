@@ -276,6 +276,34 @@ git config core.hooksPath hooks
 
 This enables a pre-commit hook that runs `sbt scalafmtCheckAll`. If formatting fails, run `sbt scalafmtAll` to fix it.
 
+## Publishing
+
+Publishing to Maven Central uses sbt's built-in Sonatype Central Portal support (sbt 1.12+).
+
+### Prerequisites
+
+- PGP key available in your GPG keyring
+- Sonatype Central credentials configured via either:
+  - Environment variables: `SONATYPE_USERNAME` and `SONATYPE_PASSWORD`
+  - Credentials file: `~/.sbt/sonatype_central_credentials`
+
+### Steps
+
+```bash
+# Sign and stage artifacts locally
+sbt publishSigned
+
+# Bundle and release to Maven Central
+sbt sonaRelease
+```
+
+To upload without auto-releasing (for manual verification on Central Portal):
+
+```bash
+sbt publishSigned
+sbt sonaUpload
+```
+
 ## License
 
 [Apache 2.0](LICENSE)
