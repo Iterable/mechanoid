@@ -14,7 +14,7 @@ env:
   JAVA_OPTS: -Dfile.encoding=UTF-8
 
 jobs:
-  build:
+  build-and-test:
     runs-on: ubuntu-latest
 
     steps:
