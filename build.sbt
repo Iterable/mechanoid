@@ -4,8 +4,8 @@ val zioVersion    = "2.1.24"
 
 ThisBuild / dependencyOverrides += "org.scalameta" % "semanticdb-scalac_2.12.21" % "4.14.4"
 ThisBuild / scalaVersion                          := scala3Version
-ThisBuild / organization                          := "io.github.russwyte"
-ThisBuild / organizationName                      := "russwyte"
+ThisBuild / organization                          := sys.env.getOrElse("PUBLISH_ORG", "io.github.russwyte")
+ThisBuild / organizationName                      := sys.env.getOrElse("PUBLISH_ORG_NAME", "russwyte")
 ThisBuild / organizationHomepage                  := Some(url("https://github.com/russwyte"))
 ThisBuild / licenses := List("Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0.txt"))
 ThisBuild / homepage := Some(url("https://github.com/russwyte/mechanoid"))
@@ -25,7 +25,22 @@ ThisBuild / developers := List(
 )
 ThisBuild / versionScheme          := Some("early-semver")
 
-usePgpKeyHex("2F64727A87F1BCF42FD307DD8582C4F16659A7D6")
+// --- Fork publishing support (GitHub Packages) ---
+// Forks set PUBLISH_PACKAGES_REPO and GITHUB_TOKEN in CI to publish to their own GitHub Packages.
+// Optionally set PUBLISH_ORG and PUBLISH_ORG_NAME to change the Maven group ID.
+val githubPackagesRepo: Option[MavenRepository] =
+  sys.env.get("PUBLISH_PACKAGES_REPO").map("GitHub Packages" at _)
+
+ThisBuild / credentials ++= sys.env.get("GITHUB_TOKEN").map { token =>
+  Credentials("GitHub Package Registry", "maven.pkg.github.com", "_", token)
+}.toSeq
+
+ThisBuild / resolvers ++= githubPackagesRepo.toSeq
+
+// PGP signing: only when publishing to Maven Central (forks targeting GitHub Packages won't have the key)
+githubPackagesRepo match
+  case None    => usePgpKeyHex("2F64727A87F1BCF42FD307DD8582C4F16659A7D6")
+  case Some(_) => Seq.empty
 
 ThisBuild / libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                      % zioVersion % "provided",
@@ -52,7 +67,7 @@ lazy val commonSettings = Seq(
 lazy val publishSettings = Seq(
   publishMavenStyle    := true,
   pomIncludeRepository := { _ => false },
-  publishTo            := localStaging.value,
+  publishTo            := githubPackagesRepo.map(r => r: Resolver).orElse(localStaging.value),
 )
 
 lazy val root = project
