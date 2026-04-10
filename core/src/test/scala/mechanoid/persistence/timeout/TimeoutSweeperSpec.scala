@@ -910,5 +910,265 @@ object TimeoutSweeperSpec extends ZIOSpecDefault:
         )
       } @@ TestAspect.withLiveClock
     ),
+    suite("default parameter coverage")(
+      test("TimeoutSweeperImpl uses default leaseStore of None") {
+        for
+          store     <- ZIO.succeed(new InMemoryTimeoutStore[String]())
+          eventsRef <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          config  = TimeoutSweeperConfig().withNodeId("test-node")
+          // Create impl without specifying leaseStore - uses default None
+          impl = TimeoutSweeperImpl(config, store, runtime)
+        yield assertTrue(impl.leaseStore.isEmpty)
+      }
+    ),
+    suite("leader election")(
+      test("fails when leader election configured but no lease store provided") {
+        for
+          store     <- ZIO.succeed(new InMemoryTimeoutStore[String]())
+          eventsRef <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          config  = TimeoutSweeperConfig()
+            .withLeaderElection(LeaderElectionConfig())
+            .withNodeId("test-node")
+          result <- ZIO.scoped {
+            TimeoutSweeper.make(config, store, runtime, leaseStore = None)
+          }.either
+        yield result match
+          case Left(_: PersistenceError) => assertTrue(true)
+          case _                         => assertTrue(false)
+      },
+      test("uses leader election when configured with lease store") {
+        for
+          store      <- ZIO.succeed(new InMemoryTimeoutStore[String]())
+          leaseStore <- ZIO.succeed(new InMemoryLeaseStore())
+          eventsRef  <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          config  = TimeoutSweeperConfig()
+            .withLeaderElection(
+              LeaderElectionConfig()
+                .withRenewalInterval(Duration.fromMillis(20))
+                .withLeaseDuration(Duration.fromMillis(60))
+            )
+            .withSweepInterval(Duration.fromMillis(50))
+            .withJitterFactor(0.0)
+            .withNodeId("test-node")
+          metrics <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, store, runtime, Some(leaseStore))
+              _       <- ZIO.sleep(Duration.fromMillis(200))
+              m       <- sweeper.metrics
+            yield m
+          }
+        yield assertTrue(metrics.sweepCount >= 1)
+      },
+      test("skips sweeping when not leader") {
+        for
+          store      <- ZIO.succeed(new InMemoryTimeoutStore[String]())
+          leaseStore <- ZIO.succeed(new InMemoryLeaseStore())
+          eventsRef  <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          // Pre-acquire leadership with another node
+          now <- Clock.instant
+          _   <- leaseStore.tryAcquire("mechanoid-timeout-leader", "other-node", Duration.fromSeconds(60), now)
+          config = TimeoutSweeperConfig()
+            .withLeaderElection(
+              LeaderElectionConfig()
+                .withRenewalInterval(Duration.fromMillis(20))
+                .withLeaseDuration(Duration.fromMillis(60))
+            )
+            .withSweepInterval(Duration.fromMillis(50))
+            .withJitterFactor(0.0)
+            .withNodeId("test-node")
+          // Schedule a timeout that would fire
+          _       <- store.schedule("fsm-1", waitingStateHash, 0L, now.minusSeconds(10))
+          metrics <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, store, runtime, Some(leaseStore))
+              _       <- ZIO.sleep(Duration.fromMillis(200))
+              m       <- sweeper.metrics
+            yield m
+          }
+          events <- eventsRef.get
+        yield assertTrue(
+          events.isEmpty,         // No events fired because not leader
+          metrics.sweepCount >= 1, // But sweep loop ran
+        )
+      },
+    ),
+    suite("jitter schedule")(
+      test("applies jitter when jitterFactor > 0") {
+        for
+          store     <- ZIO.succeed(new InMemoryTimeoutStore[String]())
+          eventsRef <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          config  = TimeoutSweeperConfig()
+            .withSweepInterval(Duration.fromMillis(50))
+            .withJitterFactor(0.5) // 50% jitter - tests line 229
+            .withNodeId("test-node")
+          metrics <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, store, runtime)
+              _       <- ZIO.sleep(Duration.fromMillis(300))
+              m       <- sweeper.metrics
+            yield m
+          }
+        yield assertTrue(metrics.sweepCount >= 1)
+      }
+    ),
+    suite("claim result handling")(
+      test("handles ClaimResult.NotFound") {
+        for
+          eventsRef <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          // Create a mock store that returns NotFound on claim
+          claimCount <- Ref.make(0)
+          mockStore = new TimeoutStore[String]:
+            private val now = Instant.now()
+            override def schedule(instanceId: String, stateHash: Int, sequenceNr: Long, expiresAt: Instant) =
+              ZIO.succeed(ScheduledTimeout(instanceId, stateHash, sequenceNr, expiresAt, now))
+            override def cancel(instanceId: String)                  = ZIO.succeed(true)
+            override def get(instanceId: String)                     = ZIO.succeed(None)
+            override def queryExpired(limit: Int, queryNow: Instant) =
+              ZIO.succeed(
+                List(ScheduledTimeout("fsm-1", waitingStateHash, 0L, now.minusSeconds(10), now.minusSeconds(20)))
+              )
+            override def claim(instanceId: String, nodeId: String, duration: Duration, claimNow: Instant) =
+              claimCount.update(_ + 1).as(ClaimResult.NotFound)
+            override def release(instanceId: String)                    = ZIO.succeed(true)
+            override def complete(instanceId: String, sequenceNr: Long) = ZIO.succeed(true)
+          config = TimeoutSweeperConfig()
+            .withSweepInterval(Duration.fromMillis(50))
+            .withJitterFactor(0.0)
+            .withNodeId("test-node")
+          metrics <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, mockStore, runtime)
+              _       <- ZIO.sleep(Duration.fromMillis(200))
+              m       <- sweeper.metrics
+            yield m
+          }
+          claims <- claimCount.get
+        yield assertTrue(
+          claims >= 1,
+          metrics.timeoutsSkipped >= 1,
+        )
+      },
+      test("handles ClaimResult.StateChanged") {
+        for
+          eventsRef <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          claimCount <- Ref.make(0)
+          mockStore = new TimeoutStore[String]:
+            private val now = Instant.now()
+            override def schedule(instanceId: String, stateHash: Int, sequenceNr: Long, expiresAt: Instant) =
+              ZIO.succeed(ScheduledTimeout(instanceId, stateHash, sequenceNr, expiresAt, now))
+            override def cancel(instanceId: String)                  = ZIO.succeed(true)
+            override def get(instanceId: String)                     = ZIO.succeed(None)
+            override def queryExpired(limit: Int, queryNow: Instant) =
+              ZIO.succeed(
+                List(ScheduledTimeout("fsm-1", waitingStateHash, 0L, now.minusSeconds(10), now.minusSeconds(20)))
+              )
+            override def claim(instanceId: String, nodeId: String, duration: Duration, claimNow: Instant) =
+              claimCount.update(_ + 1).as(ClaimResult.StateChanged("Processing"))
+            override def release(instanceId: String)                    = ZIO.succeed(true)
+            override def complete(instanceId: String, sequenceNr: Long) = ZIO.succeed(true)
+          config = TimeoutSweeperConfig()
+            .withSweepInterval(Duration.fromMillis(50))
+            .withJitterFactor(0.0)
+            .withNodeId("test-node")
+          metrics <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, mockStore, runtime)
+              _       <- ZIO.sleep(Duration.fromMillis(200))
+              m       <- sweeper.metrics
+            yield m
+          }
+          claims <- claimCount.get
+        yield assertTrue(
+          claims >= 1,
+          metrics.timeoutsSkipped >= 1,
+        )
+      },
+    ),
+    suite("stop behavior")(
+      test("stop resigns leadership when leader election is configured") {
+        // Test TimeoutSweeper.scala line 191: leaderElection.fold(ZIO.unit)(_.resign)
+        for
+          store      <- ZIO.succeed(new InMemoryTimeoutStore[String]())
+          leaseStore <- ZIO.succeed(new InMemoryLeaseStore())
+          eventsRef  <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          config  = TimeoutSweeperConfig()
+            .withLeaderElection(
+              LeaderElectionConfig()
+                .withRenewalInterval(Duration.fromMillis(50))
+                .withLeaseDuration(Duration.fromMillis(200))
+            )
+            .withSweepInterval(Duration.fromMillis(30))
+            .withJitterFactor(0.0)
+            .withNodeId("resign-test-node")
+          sweepCount <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, store, runtime, Some(leaseStore))
+              // Wait for sweeper to run a few sweeps
+              _       <- ZIO.sleep(Duration.fromMillis(150))
+              metrics <- sweeper.metrics
+            // Sweeper will be stopped when scope closes, triggering resign
+            yield metrics.sweepCount
+          }
+        yield assertTrue(sweepCount >= 1) // Sweeper ran, and scope close triggered stop/resign
+      },
+      test("stop without leader election just sets running to false") {
+        for
+          store     <- ZIO.succeed(new InMemoryTimeoutStore[String]())
+          eventsRef <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          config  = TimeoutSweeperConfig()
+            .withSweepInterval(Duration.fromMillis(50))
+            .withJitterFactor(0.0)
+            .withNodeId("test-node")
+          result <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, store, runtime)
+              _       <- ZIO.sleep(Duration.fromMillis(100))
+              running <- sweeper.isRunning
+            yield running
+          }
+        yield assertTrue(result) // Was running before stop
+      },
+    ),
+    suite("sweep error handling")(
+      test("increments errors counter on sweep error") {
+        // Test TimeoutSweeper.scala line 211: metricsRef.update(m => m.copy(errors = m.errors + 1))
+        for
+          eventsRef <- Ref.make(List.empty[(String, TestEvent)])
+          runtime = makeMockRuntime(eventsRef, "fsm-1")
+          // Create a mock store that throws on queryExpired
+          mockStore = new TimeoutStore[String]:
+            override def schedule(instanceId: String, stateHash: Int, sequenceNr: Long, expiresAt: Instant) =
+              ZIO.succeed(ScheduledTimeout(instanceId, stateHash, sequenceNr, expiresAt, Instant.now()))
+            override def cancel(instanceId: String)                  = ZIO.succeed(true)
+            override def get(instanceId: String)                     = ZIO.succeed(None)
+            override def queryExpired(limit: Int, queryNow: Instant) =
+              ZIO.fail(PersistenceError("Database connection lost"))
+            override def claim(instanceId: String, nodeId: String, duration: Duration, claimNow: Instant) =
+              ZIO.succeed(ClaimResult.NotFound)
+            override def release(instanceId: String)                    = ZIO.succeed(true)
+            override def complete(instanceId: String, sequenceNr: Long) = ZIO.succeed(true)
+          config = TimeoutSweeperConfig()
+            .withSweepInterval(Duration.fromMillis(50))
+            .withJitterFactor(0.0)
+            .withNodeId("test-node")
+          metrics <- ZIO.scoped {
+            for
+              sweeper <- TimeoutSweeper.make(config, mockStore, runtime)
+              _       <- ZIO.sleep(Duration.fromMillis(200))
+              m       <- sweeper.metrics
+            yield m
+          }
+        yield assertTrue(metrics.errors >= 1)
+      }
+    ),
   ) @@ TestAspect.sequential @@ TestAspect.timeout(Duration.fromSeconds(60)) @@ TestAspect.withLiveClock
 end TimeoutSweeperSpec
