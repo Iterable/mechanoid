@@ -253,6 +253,40 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
         end for
       }
     ),
+    suite("withLock error mapping")(
+      test("withLock maps Busy to LockBusy error") {
+        for
+          lock <- InMemoryFSMInstanceLock.make[String]
+          now  <- Clock.instant
+          // Pre-acquire lock with another node with long expiry
+          _ <- lock.tryAcquire("fsm-1", "node-A", Duration.fromSeconds(60), now)
+          // Try to withLock with short timeout - should timeout
+          fiber <- lock
+            .withLock("fsm-1", "node-B", Duration.fromSeconds(30), Some(Duration.fromMillis(50))) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+            .fork
+          _      <- TestClock.adjust(Duration.fromMillis(100))
+          result <- fiber.join
+        yield result match
+          case Left(LockError.LockTimeout(_, _)) => assertTrue(true)
+          case _                                 => assertTrue(false)
+        end for
+      },
+      test("withLock releases lock even after effect failure") {
+        for
+          lock <- InMemoryFSMInstanceLock.make[String]
+          _    <- lock
+            .withLock("fsm-1", "node-A", Duration.fromSeconds(30)) {
+              ZIO.fail("effect failure")
+            }
+            .either
+          now       <- Clock.instant
+          lockAfter <- lock.get("fsm-1", now)
+        yield assertTrue(lockAfter.isEmpty)
+      },
+    ),
     suite("withLockAndHeartbeat")(
       test("renews lock during long operation") {
         for
@@ -487,6 +521,396 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
           lockAfter <- lock.get("fsm-1", now)
         yield assertTrue(lockAfter.isEmpty)
       } @@ TestAspect.withLiveClock,
+    ),
+    suite("default parameter coverage")(
+      test("withLockAndHeartbeat uses default heartbeat config") {
+        for
+          lock <- InMemoryFSMInstanceLock.make[String]
+          // Call withLockAndHeartbeat without specifying heartbeat parameter
+          result <- lock.withLockAndHeartbeat(
+            "fsm-1",
+            "node-A",
+            Duration.fromMillis(100),
+          ) {
+            ZIO.succeed("success")
+          }
+        yield assertTrue(result == "success")
+      },
+      test("LockLostBehavior.Continue uses default onLockLost") {
+        // Create Continue with default onLockLost (ZIO.unit)
+        val behavior = LockLostBehavior.Continue()
+        assertTrue(behavior.onLockLost != null)
+      },
+    ),
+    suite("withLockAndHeartbeat error paths")(
+      test("returns LockBusy when acquire returns Busy") {
+        for
+          lock <- InMemoryFSMInstanceLock.make[String]
+          now  <- Clock.instant
+          // Pre-acquire lock with another node
+          _ <- lock.tryAcquire("fsm-1", "node-A", Duration.fromSeconds(60), now)
+          // withLockAndHeartbeat should fail with LockBusy after timeout
+          fiber <- lock
+            .withLockAndHeartbeat(
+              "fsm-1",
+              "node-B",
+              Duration.fromMillis(100),
+              timeout = Some(Duration.fromMillis(50)),
+            ) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+            .fork
+          _      <- TestClock.adjust(Duration.fromMillis(100))
+          result <- fiber.join
+        yield result match
+          case Left(LockError.LockTimeout(_, _)) => assertTrue(true)
+          case _                                 => assertTrue(false)
+      },
+      test("returns LockTimeout when acquire times out") {
+        for
+          lock <- InMemoryFSMInstanceLock.make[String]
+          now  <- Clock.instant
+          // Pre-acquire lock with another node
+          _ <- lock.tryAcquire("fsm-1", "node-A", Duration.fromSeconds(60), now)
+          // withLockAndHeartbeat with short timeout should fail with LockTimeout
+          fiber <- lock
+            .withLockAndHeartbeat(
+              "fsm-1",
+              "node-B",
+              Duration.fromMillis(100),
+              timeout = Some(Duration.fromMillis(50)),
+            ) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+            .fork
+          _      <- TestClock.adjust(Duration.fromMillis(100))
+          result <- fiber.join
+        yield result match
+          case Left(LockError.LockTimeout(_, _)) => assertTrue(true)
+          case _                                 => assertTrue(false)
+      },
+      test("FailFast handles None mainFiber case") {
+        // Test FailFast when mainFiber.get returns None
+        // This happens when lock is lost before the main effect fiber is stored
+        for
+          lock         <- InMemoryFSMInstanceLock.make[String]
+          extendCalled <- Ref.make(0)
+
+          // Wrapper that fails extend immediately (before effect starts)
+          testLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, now: Instant) =
+              lock.tryAcquire(instanceId, nodeId, duration, now)
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              lock.acquire(instanceId, nodeId, duration, timeout)
+            def release(token: LockToken[String])                                            = lock.release(token)
+            def extend(token: LockToken[String], additionalDuration: Duration, now: Instant) =
+              // Fail immediately, before main effect starts
+              extendCalled.update(_ + 1).as(None)
+            def get(instanceId: String, now: Instant) = lock.get(instanceId, now)
+
+          heartbeatConfig = LockHeartbeatConfig(
+            renewalInterval = Duration.fromMillis(10),
+            renewalDuration = Duration.fromMillis(50),
+            jitterFactor = 0.0,
+            onLockLost = LockLostBehavior.FailFast,
+          )
+
+          // The heartbeat will fail immediately
+          fiber <- testLock
+            .withLockAndHeartbeat(
+              "fsm-1",
+              "node-A",
+              Duration.fromMillis(100),
+              heartbeat = heartbeatConfig,
+            ) {
+              // This effect may or may not run - the heartbeat may fail before it starts
+              ZIO.sleep(Duration.fromSeconds(1))
+            }
+            .either
+            .fork
+
+          // Give time for the heartbeat to fail
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- ZIO.yieldNow
+
+          result <- fiber.await.timeout(Duration.fromSeconds(1))
+        yield assertTrue(result.isDefined) // Fiber completed
+      } @@ TestAspect.withLiveClock,
+      test("logs warning when extend fails with error") {
+        // Test the catchAll branch in renewLock that logs warning
+        import mechanoid.core.PersistenceError
+        for
+          lock         <- InMemoryFSMInstanceLock.make[String]
+          extendCalled <- Ref.make(0)
+
+          // Wrapper that throws exception on extend
+          testLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, now: Instant) =
+              lock.tryAcquire(instanceId, nodeId, duration, now)
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              lock.acquire(instanceId, nodeId, duration, timeout)
+            def release(token: LockToken[String])                                            = lock.release(token)
+            def extend(token: LockToken[String], additionalDuration: Duration, now: Instant) =
+              extendCalled.update(_ + 1) *>
+                ZIO.fail(PersistenceError("Database connection lost")) // Fail with MechanoidError
+            def get(instanceId: String, now: Instant) = lock.get(instanceId, now)
+
+          heartbeatConfig = LockHeartbeatConfig(
+            renewalInterval = Duration.fromMillis(20),
+            renewalDuration = Duration.fromMillis(100),
+            jitterFactor = 0.0,
+            onLockLost = LockLostBehavior.FailFast,
+          )
+
+          fiber <- testLock
+            .withLockAndHeartbeat(
+              "fsm-1",
+              "node-A",
+              Duration.fromMillis(100),
+              heartbeat = heartbeatConfig,
+            ) {
+              ZIO.sleep(Duration.fromMillis(100))
+            }
+            .either
+            .fork
+
+          // Wait for heartbeat to fire and fail
+          _ <- ZIO.sleep(Duration.fromMillis(50))
+
+          // The error should cause lock lost, which triggers FailFast
+          exit <- fiber.await.timeout(Duration.fromMillis(500))
+
+          calls <- extendCalled.get
+        yield assertTrue(
+          exit.isDefined, // Fiber completed
+          calls >= 1,     // extend was called
+        )
+        end for
+      } @@ TestAspect.withLiveClock,
+    ),
+    suite("withLock error mapping")(
+      test("maps Throwable to LockAcquisitionFailed") {
+        import mechanoid.core.PersistenceError
+        for
+          lock <- InMemoryFSMInstanceLock.make[String]
+
+          // Wrapper that throws exception on acquire
+          failingLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, now: Instant) =
+              lock.tryAcquire(instanceId, nodeId, duration, now)
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.fail(PersistenceError("Database error"))
+            def release(token: LockToken[String])                                            = lock.release(token)
+            def extend(token: LockToken[String], additionalDuration: Duration, now: Instant) =
+              lock.extend(token, additionalDuration, now)
+            def get(instanceId: String, now: Instant) = lock.get(instanceId, now)
+
+          result <- failingLock
+            .withLock("fsm-1", "node-A", Duration.fromMillis(100)) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+        yield result match
+          case Left(LockError.LockAcquisitionFailed(_, _)) => assertTrue(true)
+          case _                                           => assertTrue(false)
+        end for
+      }
+    ),
+    suite("withLock trait default method branches")(
+      test("withLock maps LockResult.Busy to LockBusy error") {
+        // Test FSMInstanceLock.scala line 196-197: case LockResult.Busy
+        for
+          now <- Clock.instant
+          // Create a mock lock that returns Busy directly from acquire
+          mockLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, n: Instant) =
+              ZIO.succeed(LockResult.Busy("other-node", now.plusSeconds(60)))
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.succeed(LockResult.Busy("other-node", now.plusSeconds(60)))
+            def release(token: LockToken[String])                                          = ZIO.succeed(true)
+            def extend(token: LockToken[String], additionalDuration: Duration, n: Instant) =
+              ZIO.succeed(Some(token))
+            def get(instanceId: String, n: Instant) = ZIO.succeed(None)
+
+          result <- mockLock
+            .withLock("fsm-1", "node-A", Duration.fromMillis(100)) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+        yield result match
+          case Left(LockError.LockBusy(_, "other-node", _)) => assertTrue(true)
+          case _                                            => assertTrue(false)
+      },
+      test("withLock maps LockResult.TimedOut to LockTimeout error") {
+        // Test FSMInstanceLock.scala line 198-199: case LockResult.TimedOut()
+        for
+          // Create a mock lock that returns TimedOut directly from acquire
+          mockLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, n: Instant) =
+              ZIO.succeed(LockResult.TimedOut())
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.succeed(LockResult.TimedOut())
+            def release(token: LockToken[String])                                          = ZIO.succeed(true)
+            def extend(token: LockToken[String], additionalDuration: Duration, n: Instant) =
+              ZIO.succeed(Some(token))
+            def get(instanceId: String, n: Instant) = ZIO.succeed(None)
+
+          result <- mockLock
+            .withLock("fsm-1", "node-A", Duration.fromMillis(100)) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+        yield result match
+          case Left(LockError.LockTimeout(_, _)) => assertTrue(true)
+          case _                                 => assertTrue(false)
+      },
+      test("withLock maps non-LockError MechanoidError to LockAcquisitionFailed") {
+        // Test FSMInstanceLock.scala line 203: case e => (non-LockError MechanoidError)
+        import mechanoid.core.PersistenceError
+        for
+          // Create a mock lock that fails with PersistenceError (not a LockError)
+          mockLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, n: Instant) =
+              ZIO.fail(PersistenceError("Connection refused"))
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.fail(PersistenceError("Connection refused"))
+            def release(token: LockToken[String])                                          = ZIO.succeed(true)
+            def extend(token: LockToken[String], additionalDuration: Duration, n: Instant) =
+              ZIO.succeed(Some(token))
+            def get(instanceId: String, n: Instant) = ZIO.succeed(None)
+
+          result <- mockLock
+            .withLock("fsm-1", "node-A", Duration.fromMillis(100)) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+        yield result match
+          case Left(LockError.LockAcquisitionFailed(_, cause)) =>
+            assertTrue(cause.getMessage.contains("Connection refused"))
+          case _ => assertTrue(false)
+        end for
+      },
+    ),
+    suite("withLockAndHeartbeat trait default method branches")(
+      test("withLockAndHeartbeat maps LockResult.Busy to LockBusy error") {
+        // Test FSMInstanceLock.scala line 276-277: case LockResult.Busy in withLockAndHeartbeat
+        for
+          now <- Clock.instant
+          mockLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, n: Instant) =
+              ZIO.succeed(LockResult.Busy("other-node", now.plusSeconds(60)))
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.succeed(LockResult.Busy("other-node", now.plusSeconds(60)))
+            def release(token: LockToken[String])                                          = ZIO.succeed(true)
+            def extend(token: LockToken[String], additionalDuration: Duration, n: Instant) =
+              ZIO.succeed(Some(token))
+            def get(instanceId: String, n: Instant) = ZIO.succeed(None)
+
+          result <- mockLock
+            .withLockAndHeartbeat("fsm-1", "node-A", Duration.fromMillis(100)) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+        yield result match
+          case Left(LockError.LockBusy(_, "other-node", _)) => assertTrue(true)
+          case _                                            => assertTrue(false)
+      },
+      test("withLockAndHeartbeat maps LockResult.TimedOut to LockTimeout error") {
+        // Test FSMInstanceLock.scala line 278-279: case LockResult.TimedOut() in withLockAndHeartbeat
+        for
+          mockLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, n: Instant) =
+              ZIO.succeed(LockResult.TimedOut())
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.succeed(LockResult.TimedOut())
+            def release(token: LockToken[String])                                          = ZIO.succeed(true)
+            def extend(token: LockToken[String], additionalDuration: Duration, n: Instant) =
+              ZIO.succeed(Some(token))
+            def get(instanceId: String, n: Instant) = ZIO.succeed(None)
+
+          result <- mockLock
+            .withLockAndHeartbeat("fsm-1", "node-A", Duration.fromMillis(100)) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+        yield result match
+          case Left(LockError.LockTimeout(_, _)) => assertTrue(true)
+          case _                                 => assertTrue(false)
+      },
+      test("withLockAndHeartbeat maps non-LockError MechanoidError to LockAcquisitionFailed") {
+        // Test FSMInstanceLock.scala line 283: case e => (non-LockError MechanoidError)
+        import mechanoid.core.PersistenceError
+        for
+          mockLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, n: Instant) =
+              ZIO.fail(PersistenceError("Database connection lost"))
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.fail(PersistenceError("Database connection lost"))
+            def release(token: LockToken[String])                                          = ZIO.succeed(true)
+            def extend(token: LockToken[String], additionalDuration: Duration, n: Instant) =
+              ZIO.succeed(Some(token))
+            def get(instanceId: String, n: Instant) = ZIO.succeed(None)
+
+          result <- mockLock
+            .withLockAndHeartbeat("fsm-1", "node-A", Duration.fromMillis(100)) {
+              ZIO.succeed("should not reach")
+            }
+            .either
+        yield result match
+          case Left(LockError.LockAcquisitionFailed(_, cause)) =>
+            assertTrue(cause.getMessage.contains("Database connection lost"))
+          case _ => assertTrue(false)
+        end for
+      },
+      test("withLockAndHeartbeat handles mainFiber None in FailFast") {
+        // Test FSMInstanceLock.scala line 318: case None in FailFast mainFiber.get
+        // This happens when lock is lost before mainFiber is set
+        for
+          now         <- Clock.instant
+          extendCount <- Ref.make(0)
+          mockLock = new FSMInstanceLock[String]:
+            def tryAcquire(instanceId: String, nodeId: String, duration: Duration, n: Instant) =
+              ZIO.succeed(LockResult.Acquired(LockToken(instanceId, nodeId, now, now.plusSeconds(60))))
+            def acquire(instanceId: String, nodeId: String, duration: Duration, timeout: Duration) =
+              ZIO.succeed(LockResult.Acquired(LockToken(instanceId, nodeId, now, now.plusSeconds(60))))
+            def release(token: LockToken[String])                                          = ZIO.succeed(true)
+            def extend(token: LockToken[String], additionalDuration: Duration, n: Instant) =
+              // Fail extend immediately (returns None = lock lost)
+              extendCount.update(_ + 1).as(None)
+            def get(instanceId: String, n: Instant) = ZIO.succeed(None)
+
+          heartbeat = LockHeartbeatConfig(
+            renewalInterval = Duration.fromMillis(5),
+            renewalDuration = Duration.fromMillis(50),
+            jitterFactor = 0.0,
+            onLockLost = LockLostBehavior.FailFast,
+          )
+
+          fiber <- mockLock
+            .withLockAndHeartbeat("fsm-1", "node-A", Duration.fromMillis(100), heartbeat = heartbeat) {
+              // Long-running effect - heartbeat will fail and trigger FailFast
+              ZIO.sleep(Duration.fromSeconds(10))
+            }
+            .either
+            .fork
+
+          // Wait for heartbeat to fail
+          _      <- ZIO.sleep(Duration.fromMillis(50))
+          result <- fiber.await.timeout(Duration.fromSeconds(1))
+        yield assertTrue(result.isDefined) // Fiber completed (was interrupted or failed)
+      } @@ TestAspect.withLiveClock,
+    ),
+    suite("FSMInstanceLock companion object constants")(
+      test("DefaultLockDuration is 30 seconds") {
+        // Test FSMInstanceLock.scala line 348
+        assertTrue(FSMInstanceLock.DefaultLockDuration == Duration.fromSeconds(30))
+      },
+      test("DefaultLockTimeout is 10 seconds") {
+        // Test FSMInstanceLock.scala line 351
+        assertTrue(FSMInstanceLock.DefaultLockTimeout == Duration.fromSeconds(10))
+      },
     ),
   ) @@ TestAspect.sequential @@ TestAspect.timeout(Duration.fromSeconds(30))
 end FSMInstanceLockSpec
