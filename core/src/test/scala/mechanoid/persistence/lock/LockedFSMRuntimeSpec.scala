@@ -105,7 +105,7 @@ object LockedFSMRuntimeSpec extends ZIOSpecDefault:
           _     <- lockedRuntime.send(E1)
           state <- lockedRuntime.currentState
         yield assertTrue(state == B)
-      } @@ TestAspect.withLiveClock,
+      },
       test("skips validation when validateBeforeOperation is false") {
         for
           lock    <- InMemoryFSMInstanceLock.make[String]
@@ -115,7 +115,7 @@ object LockedFSMRuntimeSpec extends ZIOSpecDefault:
           _     <- lockedRuntime.send(E1)
           state <- lockedRuntime.currentState
         yield assertTrue(state == B)
-      } @@ TestAspect.withLiveClock,
+      },
     ),
     suite("lock validation error paths")(
       test("validation fails when lock held by another node") {
