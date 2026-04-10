@@ -309,25 +309,37 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             def get(instanceId: String, now: Instant) = lock.get(instanceId, now)
 
           heartbeatConfig = LockHeartbeatConfig(
-            renewalInterval = Duration.fromMillis(50),
-            renewalDuration = Duration.fromMillis(200),
-            jitterFactor = 0.0, // No jitter for predictable testing
+            renewalInterval = Duration.fromMillis(100),
+            renewalDuration = Duration.fromMillis(500),
+            jitterFactor = 0.0, // No jitter for deterministic timing
             onLockLost = LockLostBehavior.FailFast,
           )
 
-          // Run an operation that takes longer than the renewal interval
-          _ <- trackingLock.withLockAndHeartbeat(
-            "fsm-1",
-            "node-A",
-            Duration.fromMillis(200),
-            heartbeat = heartbeatConfig,
-          ) {
-            ZIO.sleep(Duration.fromMillis(200))
-          }
+          // Fork the heartbeat operation with a sleep controlled by TestClock
+          fiber <- trackingLock
+            .withLockAndHeartbeat(
+              "fsm-1",
+              "node-A",
+              Duration.fromMillis(500),
+              heartbeat = heartbeatConfig,
+            ) {
+              ZIO.sleep(Duration.fromMillis(350)) // Will trigger 3 renewals at 100ms intervals
+            }
+            .fork
+
+          // Advance time to trigger heartbeat renewals deterministically
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- fiber.join
 
           count <- renewCount.get
-        yield assertTrue(count >= 2) // Should have renewed at least twice in 200ms with 50ms interval
-      } @@ TestAspect.withLiveClock,
+        yield assertTrue(count >= 2) // Should have renewed at least twice
+      },
       test("stops renewal when operation completes") {
         for
           lock       <- InMemoryFSMInstanceLock.make[String]
@@ -396,8 +408,8 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             def get(instanceId: String, now: Instant) = lock.get(instanceId, now)
 
           heartbeatConfig = LockHeartbeatConfig(
-            renewalInterval = Duration.fromMillis(50),
-            renewalDuration = Duration.fromMillis(200),
+            renewalInterval = Duration.fromMillis(100),
+            renewalDuration = Duration.fromMillis(500),
             jitterFactor = 0.0,
             onLockLost = LockLostBehavior.FailFast,
           )
@@ -406,7 +418,7 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             .withLockAndHeartbeat(
               "fsm-1",
               "node-A",
-              Duration.fromMillis(200),
+              Duration.fromMillis(500),
               heartbeat = heartbeatConfig,
             ) {
               effectStarted.succeed(()) *>
@@ -417,19 +429,21 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
           // Wait for effect to start
           _ <- effectStarted.await
 
-          // Wait for at least one successful heartbeat to fire
-          _ <- extendCalled.get.repeatUntil(_ >= 1).timeout(Duration.fromMillis(200))
+          // Advance time to trigger first successful heartbeat
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
 
           // Make extend fail, which triggers FailFast on next heartbeat
           _ <- failExtend.set(true)
 
-          // Wait for the fiber to complete (should be interrupted)
-          exit <- fiber.await.timeout(Duration.fromSeconds(2))
-        yield assertTrue(
-          exit.isDefined,        // Fiber completed (didn't timeout)
-          exit.get.isInterrupted, // Fiber was interrupted
-        )
-      } @@ TestAspect.withLiveClock,
+          // Advance time to trigger the failing heartbeat
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
+
+          // The fiber should be interrupted
+          exit <- fiber.await
+        yield assertTrue(exit.isInterrupted)
+      },
       test("Continue runs onLockLost effect and continues") {
         for
           lock            <- InMemoryFSMInstanceLock.make[String]
@@ -453,8 +467,8 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             def get(instanceId: String, now: Instant) = lock.get(instanceId, now)
 
           heartbeatConfig = LockHeartbeatConfig(
-            renewalInterval = Duration.fromMillis(20),
-            renewalDuration = Duration.fromMillis(100),
+            renewalInterval = Duration.fromMillis(50),
+            renewalDuration = Duration.fromMillis(200),
             jitterFactor = 0.0,
             onLockLost = LockLostBehavior.Continue(
               lockLostCalled.set(true)
@@ -465,11 +479,11 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             .withLockAndHeartbeat(
               "fsm-1",
               "node-A",
-              Duration.fromMillis(100),
+              Duration.fromMillis(200),
               heartbeat = heartbeatConfig,
             ) {
               effectStarted.succeed(()) *>
-                ZIO.sleep(Duration.fromMillis(100)) *>
+                ZIO.sleep(Duration.fromMillis(200)) *>
                 effectCompleted.set(true).as("done")
             }
             .fork
@@ -477,50 +491,65 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
           // Wait for effect to start
           _ <- effectStarted.await
 
-          // Wait for first heartbeat to fire
-          _ <- ZIO.sleep(Duration.fromMillis(25))
+          // Advance time to trigger first successful heartbeat
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- ZIO.yieldNow
 
           // Make extend fail, which triggers Continue behavior
           _ <- failExtend.set(true)
 
-          // Poll for lockLostCalled to become true
-          _ <- lockLostCalled.get
-            .repeatUntil(identity)
-            .timeoutFail(new RuntimeException("onLockLost was not called"))(Duration.fromMillis(500))
+          // Advance time to trigger the failing heartbeat
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- ZIO.yieldNow
+
+          // onLockLost should have been called
+          wasLockLostCalled <- lockLostCalled.get
+
+          // Advance time to complete the main effect
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
 
           // Wait for operation to complete
           result <- fiber.join.either
 
           didComplete <- effectCompleted.get
         yield assertTrue(
+          wasLockLostCalled,
           didComplete,
           result.isRight, // Operation completed successfully despite lock loss
         )
-      } @@ TestAspect.withLiveClock,
+      },
       test("releases lock after effect completes") {
         for
           lock <- InMemoryFSMInstanceLock.make[String]
 
           heartbeatConfig = LockHeartbeatConfig(
-            renewalInterval = Duration.fromMillis(50),
-            renewalDuration = Duration.fromMillis(200),
+            renewalInterval = Duration.fromMillis(100),
+            renewalDuration = Duration.fromMillis(500),
             jitterFactor = 0.0,
           )
 
-          _ <- lock
+          fiber <- lock
             .withLockAndHeartbeat(
               "fsm-1",
               "node-A",
-              Duration.fromMillis(200),
+              Duration.fromMillis(500),
               heartbeat = heartbeatConfig,
             ) {
-              ZIO.sleep(Duration.fromMillis(100))
+              ZIO.sleep(Duration.fromMillis(150))
             }
+            .fork
+
+          // Advance time to trigger one heartbeat and complete the effect
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- fiber.join
 
           now       <- Clock.instant
           lockAfter <- lock.get("fsm-1", now)
         yield assertTrue(lockAfter.isEmpty)
-      } @@ TestAspect.withLiveClock,
+      },
     ),
     suite("default parameter coverage")(
       test("withLockAndHeartbeat uses default heartbeat config") {
@@ -635,9 +664,9 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
           _ <- TestClock.adjust(Duration.fromMillis(50))
           _ <- ZIO.yieldNow
 
-          result <- fiber.await.timeout(Duration.fromSeconds(1))
-        yield assertTrue(result.isDefined) // Fiber completed
-      } @@ TestAspect.withLiveClock,
+          result <- fiber.await
+        yield assertTrue(result.toEither.isLeft || result.isInterrupted) // Either failed or was interrupted
+      },
       test("logs warning when extend fails with error") {
         // Test the catchAll branch in renewLock that logs warning
         import mechanoid.core.PersistenceError
@@ -658,8 +687,8 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             def get(instanceId: String, now: Instant) = lock.get(instanceId, now)
 
           heartbeatConfig = LockHeartbeatConfig(
-            renewalInterval = Duration.fromMillis(20),
-            renewalDuration = Duration.fromMillis(100),
+            renewalInterval = Duration.fromMillis(50),
+            renewalDuration = Duration.fromMillis(200),
             jitterFactor = 0.0,
             onLockLost = LockLostBehavior.FailFast,
           )
@@ -668,27 +697,28 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             .withLockAndHeartbeat(
               "fsm-1",
               "node-A",
-              Duration.fromMillis(100),
+              Duration.fromMillis(200),
               heartbeat = heartbeatConfig,
             ) {
-              ZIO.sleep(Duration.fromMillis(100))
+              ZIO.sleep(Duration.fromMillis(200))
             }
             .either
             .fork
 
-          // Wait for heartbeat to fire and fail
-          _ <- ZIO.sleep(Duration.fromMillis(50))
+          // Advance time to trigger heartbeat failure
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- ZIO.yieldNow
 
           // The error should cause lock lost, which triggers FailFast
-          exit <- fiber.await.timeout(Duration.fromMillis(500))
+          exit <- fiber.await
 
           calls <- extendCalled.get
         yield assertTrue(
-          exit.isDefined, // Fiber completed
-          calls >= 1,     // extend was called
+          exit.toEither.isLeft || exit.isInterrupted, // Fiber failed or was interrupted
+          calls >= 1,                                 // extend was called
         )
         end for
-      } @@ TestAspect.withLiveClock,
+      },
     ),
     suite("withLock error mapping")(
       test("maps Throwable to LockAcquisitionFailed") {
@@ -882,25 +912,27 @@ object FSMInstanceLockSpec extends ZIOSpecDefault:
             def get(instanceId: String, n: Instant) = ZIO.succeed(None)
 
           heartbeat = LockHeartbeatConfig(
-            renewalInterval = Duration.fromMillis(5),
-            renewalDuration = Duration.fromMillis(50),
+            renewalInterval = Duration.fromMillis(50),
+            renewalDuration = Duration.fromMillis(200),
             jitterFactor = 0.0,
             onLockLost = LockLostBehavior.FailFast,
           )
 
           fiber <- mockLock
-            .withLockAndHeartbeat("fsm-1", "node-A", Duration.fromMillis(100), heartbeat = heartbeat) {
+            .withLockAndHeartbeat("fsm-1", "node-A", Duration.fromMillis(200), heartbeat = heartbeat) {
               // Long-running effect - heartbeat will fail and trigger FailFast
               ZIO.sleep(Duration.fromSeconds(10))
             }
             .either
             .fork
 
-          // Wait for heartbeat to fail
-          _      <- ZIO.sleep(Duration.fromMillis(50))
-          result <- fiber.await.timeout(Duration.fromSeconds(1))
-        yield assertTrue(result.isDefined) // Fiber completed (was interrupted or failed)
-      } @@ TestAspect.withLiveClock,
+          // Advance time to trigger heartbeat failure
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- ZIO.yieldNow
+
+          result <- fiber.await
+        yield assertTrue(result.toEither.isLeft || result.isInterrupted) // Fiber completed (was interrupted or failed)
+      },
     ),
     suite("FSMInstanceLock companion object constants")(
       test("DefaultLockDuration is 30 seconds") {

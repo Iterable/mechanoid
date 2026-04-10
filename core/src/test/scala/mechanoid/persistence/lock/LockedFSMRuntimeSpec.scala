@@ -105,7 +105,7 @@ object LockedFSMRuntimeSpec extends ZIOSpecDefault:
           _     <- lockedRuntime.send(E1)
           state <- lockedRuntime.currentState
         yield assertTrue(state == B)
-      } @@ TestAspect.withLiveClock,
+      },
       test("skips validation when validateBeforeOperation is false") {
         for
           lock    <- InMemoryFSMInstanceLock.make[String]
@@ -115,7 +115,7 @@ object LockedFSMRuntimeSpec extends ZIOSpecDefault:
           _     <- lockedRuntime.send(E1)
           state <- lockedRuntime.currentState
         yield assertTrue(state == B)
-      } @@ TestAspect.withLiveClock,
+      },
     ),
     suite("lock validation error paths")(
       test("validation fails when lock held by another node") {
@@ -343,20 +343,35 @@ object LockedFSMRuntimeSpec extends ZIOSpecDefault:
           lockedRuntime = LockedFSMRuntime.withConfig(runtime, trackingLock, LockConfig.withNodeId("test-node"))
 
           heartbeatConfig = LockHeartbeatConfig(
-            renewalInterval = Duration.fromMillis(50),
-            renewalDuration = Duration.fromMillis(200),
-            jitterFactor = 0.0, // No jitter for more predictable timing
+            renewalInterval = Duration.fromMillis(100),
+            renewalDuration = Duration.fromMillis(500),
+            jitterFactor = 0.0, // No jitter for deterministic timing
           )
 
-          // Run the transaction that takes longer than the renewal interval
-          _ <- lockedRuntime
+          // Fork the transaction with a sleep that will be controlled by TestClock
+          fiber <- lockedRuntime
             .withAtomicTransitions(heartbeatConfig) { _ =>
-              ZIO.sleep(Duration.fromMillis(200))
+              ZIO.sleep(Duration.fromMillis(350)) // Will trigger 3 renewals at 100ms intervals
             }
+            .fork
+
+          // Advance time to trigger heartbeat renewals deterministically
+          // At 100ms: first renewal
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow // Let heartbeat fiber run
+          // At 200ms: second renewal
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
+          // At 300ms: third renewal
+          _ <- TestClock.adjust(Duration.fromMillis(100))
+          _ <- ZIO.yieldNow
+          // At 350ms: main effect completes
+          _ <- TestClock.adjust(Duration.fromMillis(50))
+          _ <- fiber.join
 
           count <- renewCount.get
         yield assertTrue(count >= 2) // Should have renewed at least twice
-      } @@ TestAspect.withLiveClock,
+      },
       // Note: FailFast behavior is tested in FSMInstanceLockSpec.
       // The withAtomicTransitions method uses withLockAndHeartbeat, so the behavior is identical.
       test("releases lock after transaction completes") {
