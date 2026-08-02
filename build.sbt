@@ -111,7 +111,7 @@ ThisBuild / libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test"          % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"      % zioVersion % Test,
   "dev.zio" %% "zio-test-magnolia" % zioVersion % Test,
-  )
+)
 
 lazy val commonSettings = Seq(
   scalacOptions ++= Seq(
@@ -125,8 +125,8 @@ lazy val commonSettings = Seq(
   // - Mechanoid$package is just type re-exports with no runtime code
   coverageExcludedPackages := "mechanoid\\.macros\\..*;mechanoid\\.machine\\.Macros.*;mechanoid\\.machine\\.MacroUtils.*;mechanoid\\.machine\\.AssemblyMacros.*;mechanoid\\.machine\\.MachineMacros.*;mechanoid\\.machine\\.ProducingMacros.*;mechanoid\\.core\\.Finite.*;mechanoid\\.core\\.Redactor.*;mechanoid\\.Mechanoid\\$package.*",
   // Minimum coverage thresholds - fail build if coverage drops below these
-  coverageFailOnMinimum := true,
-  coverageMinimumStmtTotal := 95,
+  coverageFailOnMinimum      := true,
+  coverageMinimumStmtTotal   := 95,
   coverageMinimumBranchTotal := 95,
 )
 
@@ -170,10 +170,10 @@ lazy val postgres = project
     description := "PostgreSQL persistence implementation for Mechanoid FSM library",
     libraryDependencies ++= Seq(
       "rocks.earlyeffect" %% "saferis"      % "0.19.0",
-      "org.postgresql"      % "postgresql"   % "42.7.13",
-      "org.testcontainers"  % "postgresql"   % "1.21.4"   % Test,
-      "dev.zio"            %% "zio-test"     % zioVersion % Test,
-      "dev.zio"            %% "zio-test-sbt" % zioVersion % Test,
+      "org.postgresql"     % "postgresql"   % "42.7.13",
+      "org.testcontainers" % "postgresql"   % "1.21.4"   % Test,
+      "dev.zio"           %% "zio-test"     % zioVersion % Test,
+      "dev.zio"           %% "zio-test-sbt" % zioVersion % Test,
     ),
     // Override vulnerable transitive deps from testcontainers -> docker-java
     dependencyOverrides ++= Seq(
